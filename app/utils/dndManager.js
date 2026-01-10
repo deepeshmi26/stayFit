@@ -148,7 +148,16 @@ class DndManager extends EventEmitter {
             return true
           }
         } catch (e) {
-          this._logErrorOnce('macos', e)
+          // DND detection may not be available on all macOS versions
+          // This is not a critical error - silently handle expected cases
+          if (e.message && e.message.includes('does not exist')) {
+            // Preference doesn't exist on this macOS version - this is expected
+            // Silently return false (DND not detected)
+            return false
+          } else {
+            // Only log unexpected errors
+            this._logErrorOnce('macos', e)
+          }
         }
       } else if (process.platform === 'linux') {
         return await this._isDndEnabledLinux()

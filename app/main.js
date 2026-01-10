@@ -5,6 +5,8 @@ import {
 } from 'electron'
 import { EventEmitter } from 'node:events'
 import { readFile, writeFile, existsSync, mkdirSync } from 'node:fs'
+import { exec } from 'node:child_process'
+import { promisify } from 'util'
 import { dirname, join } from 'path'
 import { resolveLocalImage } from './utils/imageResolver.js'
 import { fileURLToPath } from 'url'
@@ -196,7 +198,7 @@ app.on('window-all-closed', () => {
 })
 app.on('before-quit', (event) => {
   if ((breakPlanner.scheduler.reference === 'finishMicrobreak' && settings.get('microbreakStrictMode')) ||
-      (breakPlanner.scheduler.reference === 'finishBreak' && settings.get('breakStrictMode'))
+    (breakPlanner.scheduler.reference === 'finishBreak' && settings.get('breakStrictMode'))
   ) {
     log.info('Stretchly: preventing app closure (in break with strict mode)')
     event.preventDefault()
@@ -701,10 +703,144 @@ function getBlurredBackgroundWindowOptions () {
   }
 }
 
-function startMicrobreak () {
+const execAsync = promisify(exec)
+
+/**
+ * Check if Chrome is running and get its window positions
+ * Returns array of Chrome window bounds: [{x, y, width, height}, ...]
+ */
+async function getChromeWindows () {
+  if (process.platform !== 'darwin') {
+    // For non-macOS, return empty array (feature only works on macOS)
+    return []
+  }
+
+  try {
+    // Use AppleScript to access Chrome directly (more reliable than System Events)
+    // Chrome's bounds format is {left, top, right, bottom}
+    const script = `
+      tell application "System Events"
+        if not (exists process "Google Chrome") and not (exists process "Chromium") then
+          return ""
+        end if
+      end tell
+      try
+        tell application "Google Chrome"
+          set windowList to {}
+          repeat with w in windows
+            try
+              if visible of w then
+                set windowBounds to bounds of w
+                -- bounds format: {left, top, right, bottom}
+                -- convert to: {x, y, width, height}
+                set x to item 1 of windowBounds
+                set y to item 2 of windowBounds
+                set width to (item 3 of windowBounds) - x
+                set height to (item 4 of windowBounds) - y
+                set end of windowList to {x, y, width, height}
+              end if
+            end try
+          end repeat
+          return windowList
+        end tell
+      on error
+        try
+          tell application "Chromium"
+            set windowList to {}
+            repeat with w in windows
+              try
+                if visible of w then
+                  set windowBounds to bounds of w
+                  set x to item 1 of windowBounds
+                  set y to item 2 of windowBounds
+                  set width to (item 3 of windowBounds) - x
+                  set height to (item 4 of windowBounds) - y
+                  set end of windowList to {x, y, width, height}
+                end if
+              end try
+            end repeat
+            return windowList
+          end tell
+        on error errMsg
+          return ""
+        end try
+      end try
+    `
+    const { stdout } = await execAsync(`osascript -e '${script}'`)
+
+    if (!stdout || stdout.trim() === '') {
+      log.debug('Stretchly: Chrome is not running or has no visible windows')
+      return []
+    }
+
+    // Parse AppleScript output: comma-separated list "x1, y1, w1, h1, x2, y2, w2, h2, ..."
+    const windows = []
+    const numbers = stdout.trim().split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n))
+
+    // Each window has 4 values: x, y, width, height
+    for (let i = 0; i < numbers.length; i += 4) {
+      if (i + 3 < numbers.length) {
+        windows.push({
+          x: numbers[i],
+          y: numbers[i + 1],
+          width: numbers[i + 2],
+          height: numbers[i + 3]
+        })
+      }
+    }
+
+    if (windows.length === 0) {
+      log.debug('Stretchly: Chrome windows found but could not parse positions')
+      log.debug(`Stretchly: Raw output: ${stdout}`)
+    } else {
+      log.info(`Stretchly: Detected ${windows.length} visible Chrome window(s)`)
+    }
+
+    return windows
+  } catch (error) {
+    log.warn('Stretchly: Could not detect Chrome windows:', error.message)
+    return []
+  }
+}
+
+/**
+ * Check if Chrome is the active/frontmost application
+ */
+async function isChromeActive () {
+  if (process.platform !== 'darwin') {
+    return false
+  }
+
+  try {
+    const { stdout } = await execAsync(
+      'osascript -e \'tell application "System Events" to get name of first application process whose frontmost is true\''
+    )
+    const appName = stdout.trim().toLowerCase()
+    return appName.includes('chrome') || appName.includes('chromium')
+  } catch (error) {
+    log.warn('Stretchly: Could not check active application:', error.message)
+    return false
+  }
+}
+
+async function startMicrobreak () {
   // don't start another break if break running
   if (microbreakWins) {
     log.warn('Stretchly: Mini break already running, not starting Mini break')
+    return
+  }
+
+  // Check if Chrome is active before showing break overlay
+  const chromeActive = await isChromeActive()
+  if (!chromeActive) {
+    log.info('Stretchly: Chrome is not active, skipping break overlay')
+    return
+  }
+
+  // Get Chrome window positions
+  const chromeWindows = await getChromeWindows()
+  if (chromeWindows.length === 0) {
+    log.info('Stretchly: No Chrome windows detected, skipping break overlay')
     return
   }
 
@@ -751,40 +887,34 @@ function startMicrobreak () {
       calculateBackgroundColor(settings.get('miniBreakColor'))]
   })
 
-  for (let localDisplayId = 0; localDisplayId < displayManager.getDisplayCount(); localDisplayId++) {
+  // Create overlay windows for each Chrome window
+  for (let i = 0; i < chromeWindows.length; i++) {
+    const chromeWindow = chromeWindows[i]
     const windowOptions = {
-      width: Math.floor(displayManager.getDisplayWidth(localDisplayId) * settings.get('breakWindowWidth')),
-      height: Math.floor(displayManager.getDisplayHeight(localDisplayId) * settings.get('breakWindowHeight')),
+      width: chromeWindow.width,
+      height: chromeWindow.height,
+      x: chromeWindow.x,
+      y: chromeWindow.y,
       autoHideMenuBar: true,
       icon: windowIconPath(),
       resizable: false,
-      frame: showBreaksAsRegularWindows,
+      frame: false,
       show: false,
       backgroundThrottling: false,
-      transparent: !showBreaksAsRegularWindows,
+      transparent: true,
       ...getBlurredBackgroundWindowOptions(),
       backgroundColor: calculateBackgroundColor(settings.get('miniBreakColor')),
-      skipTaskbar: !showBreaksAsRegularWindows,
-      focusable: showBreaksAsRegularWindows,
-      alwaysOnTop: !showBreaksAsRegularWindows,
+      skipTaskbar: true,
+      focusable: false,
+      alwaysOnTop: true,
       hasShadow: false,
       title: 'Stretchly',
-      titleBarStyle: process.platform === 'darwin' ? (showBreaksAsRegularWindows ? 'default' : 'hidden') : undefined,
-      titleBarOverlay: process.platform === 'darwin' ? !showBreaksAsRegularWindows : undefined,
+      titleBarStyle: 'hidden',
+      titleBarOverlay: true,
       webPreferences: {
         preload: join(__dirname, './microbreak-preload.mjs'),
         sandbox: false
       }
-    }
-
-    if (settings.get('fullscreen') && process.platform !== 'darwin') {
-      windowOptions.width = displayManager.getDisplayWidth(localDisplayId)
-      windowOptions.height = displayManager.getDisplayHeight(localDisplayId)
-      windowOptions.x = displayManager.getDisplayX(localDisplayId, 0, true)
-      windowOptions.y = displayManager.getDisplayY(localDisplayId, 0, true)
-    } else if (!(settings.get('fullscreen') && process.platform === 'win32')) {
-      windowOptions.x = displayManager.getDisplayX(localDisplayId, windowOptions.width, false)
-      windowOptions.y = displayManager.getDisplayY(localDisplayId, windowOptions.height, false)
     }
 
     let microbreakWinLocal = new BrowserWindow(windowOptions)
@@ -803,31 +933,23 @@ function startMicrobreak () {
         microbreakWinLocal.showInactive()
       }
 
-      log.info(`Stretchly: showing window ${localDisplayId + 1} of ${displayManager.getDisplayCount()}`)
+      log.info(`Stretchly: showing Chrome overlay window ${i + 1} of ${chromeWindows.length}`)
       if (process.platform === 'darwin') {
-        if (showBreaksAsRegularWindows) {
-          microbreakWinLocal.setFullScreen(settings.get('fullscreen'))
-        } else {
-          microbreakWinLocal.setMinimizable(false)
-          microbreakWinLocal.setClosable(false)
-          microbreakWinLocal.setKiosk(settings.get('fullscreen'))
-        }
+        microbreakWinLocal.setMinimizable(false)
+        microbreakWinLocal.setClosable(false)
+        microbreakWinLocal.setFullScreen(false)
+        microbreakWinLocal.setKiosk(false)
       }
-      if (localDisplayId === 0) {
+      if (i === 0) {
         breakPlanner.emit('microbreakStarted', true)
-        log.info('Stretchly: starting Mini break')
-      }
-      if (!settings.get('fullscreen') && process.platform !== 'darwin') {
-        setTimeout(() => {
-          microbreakWinLocal.center()
-        }, 0)
+        log.info('Stretchly: starting Mini break over Chrome')
       }
       updateTray()
     })
 
     microbreakWinLocal.loadURL(modalPath)
     microbreakWinLocal.setVisibleOnAllWorkspaces(true)
-    microbreakWinLocal.setAlwaysOnTop(!showBreaksAsRegularWindows, 'pop-up-menu')
+    microbreakWinLocal.setAlwaysOnTop(true, 'pop-up-menu')
     if (microbreakWinLocal) {
       microbreakWinLocal.on('close', (e) => {
         if (breakPlanner.scheduler.timeLeft > 0 && settings.get('microbreakStrictMode')) {
@@ -840,13 +962,6 @@ function startMicrobreak () {
       })
     }
     microbreakWins.push(microbreakWinLocal)
-
-    if (!settings.get('allScreens')) {
-      if (displayManager.getDisplayCount() > 1) {
-        log.info('Stretchly: not showing on more Monitors as it is disabled.')
-      }
-      break
-    }
   }
   if (process.platform === 'darwin') {
     if (app.dock.isVisible) {
@@ -855,9 +970,23 @@ function startMicrobreak () {
   }
 }
 
-function startBreak () {
+async function startBreak () {
   if (breakWins) {
     log.warn('Stretchly: Long break already running, not starting Long break')
+    return
+  }
+
+  // Check if Chrome is active before showing break overlay
+  const chromeActive = await isChromeActive()
+  if (!chromeActive) {
+    log.info('Stretchly: Chrome is not active, skipping break overlay')
+    return
+  }
+
+  // Get Chrome window positions
+  const chromeWindows = await getChromeWindows()
+  if (chromeWindows.length === 0) {
+    log.info('Stretchly: No Chrome windows detected, skipping break overlay')
     return
   }
 
@@ -905,40 +1034,34 @@ function startBreak () {
       calculateBackgroundColor(settings.get('mainColor'))]
   })
 
-  for (let localDisplayId = 0; localDisplayId < displayManager.getDisplayCount(); localDisplayId++) {
+  // Create overlay windows for each Chrome window
+  for (let i = 0; i < chromeWindows.length; i++) {
+    const chromeWindow = chromeWindows[i]
     const windowOptions = {
-      width: Math.floor(displayManager.getDisplayWidth(localDisplayId) * settings.get('breakWindowWidth')),
-      height: Math.floor(displayManager.getDisplayHeight(localDisplayId) * settings.get('breakWindowHeight')),
+      width: chromeWindow.width,
+      height: chromeWindow.height,
+      x: chromeWindow.x,
+      y: chromeWindow.y,
       autoHideMenuBar: true,
       icon: windowIconPath(),
       resizable: false,
-      frame: showBreaksAsRegularWindows,
+      frame: false,
       show: false,
       backgroundThrottling: false,
-      transparent: !showBreaksAsRegularWindows,
+      transparent: true,
       ...getBlurredBackgroundWindowOptions(),
       backgroundColor: calculateBackgroundColor(settings.get('mainColor')),
-      skipTaskbar: !showBreaksAsRegularWindows,
-      focusable: showBreaksAsRegularWindows,
-      alwaysOnTop: !showBreaksAsRegularWindows,
+      skipTaskbar: true,
+      focusable: false,
+      alwaysOnTop: true,
       hasShadow: false,
       title: 'Stretchly',
-      titleBarStyle: process.platform === 'darwin' ? (showBreaksAsRegularWindows ? 'default' : 'hidden') : undefined,
-      titleBarOverlay: process.platform === 'darwin' ? !showBreaksAsRegularWindows : undefined,
+      titleBarStyle: 'hidden',
+      titleBarOverlay: true,
       webPreferences: {
         preload: join(__dirname, './break-preload.mjs'),
         sandbox: false
       }
-    }
-
-    if (settings.get('fullscreen') && process.platform !== 'darwin') {
-      windowOptions.width = displayManager.getDisplayWidth(localDisplayId)
-      windowOptions.height = displayManager.getDisplayHeight(localDisplayId)
-      windowOptions.x = displayManager.getDisplayX(localDisplayId, 0, true)
-      windowOptions.y = displayManager.getDisplayY(localDisplayId, 0, true)
-    } else if (!(settings.get('fullscreen') && process.platform === 'win32')) {
-      windowOptions.x = displayManager.getDisplayX(localDisplayId, windowOptions.width, false)
-      windowOptions.y = displayManager.getDisplayY(localDisplayId, windowOptions.height, false)
     }
 
     let breakWinLocal = new BrowserWindow(windowOptions)
@@ -957,32 +1080,23 @@ function startBreak () {
         breakWinLocal.showInactive()
       }
 
-      log.info(`Stretchly: showing window ${localDisplayId + 1} of ${displayManager.getDisplayCount()}`)
+      log.info(`Stretchly: showing Chrome overlay window ${i + 1} of ${chromeWindows.length}`)
       if (process.platform === 'darwin') {
-        if (showBreaksAsRegularWindows) {
-          breakWinLocal.setFullScreen(settings.get('fullscreen'))
-        } else {
-          breakWinLocal.setMinimizable(false)
-          breakWinLocal.setClosable(false)
-          breakWinLocal.setKiosk(settings.get('fullscreen'))
-        }
+        breakWinLocal.setMinimizable(false)
+        breakWinLocal.setClosable(false)
+        breakWinLocal.setFullScreen(false)
+        breakWinLocal.setKiosk(false)
       }
-      if (localDisplayId === 0) {
+      if (i === 0) {
         breakPlanner.emit('breakStarted', true)
-        log.info('Stretchly: starting Long break')
-      }
-
-      if (!settings.get('fullscreen') && process.platform !== 'darwin') {
-        setTimeout(() => {
-          breakWinLocal.center()
-        }, 0)
+        log.info('Stretchly: starting Long break over Chrome')
       }
       updateTray()
     })
 
     breakWinLocal.loadURL(modalPath)
     breakWinLocal.setVisibleOnAllWorkspaces(true)
-    breakWinLocal.setAlwaysOnTop(!showBreaksAsRegularWindows, 'pop-up-menu')
+    breakWinLocal.setAlwaysOnTop(true, 'pop-up-menu')
     if (breakWinLocal) {
       breakWinLocal.on('close', (e) => {
         if (breakPlanner.scheduler.timeLeft > 0 && settings.get('breakStrictMode')) {
@@ -995,13 +1109,6 @@ function startBreak () {
       })
     }
     breakWins.push(breakWinLocal)
-
-    if (!settings.get('allScreens')) {
-      if (displayManager.getDisplayCount() > 1) {
-        log.info('Stretchly: not showing on more Monitors as it is disabled.')
-      }
-      break
-    }
   }
   if (process.platform === 'darwin') {
     if (app.dock.isVisible) {
@@ -1302,8 +1409,8 @@ function getTrayMenuTemplate () {
   }
 
   if ((breakPlanner.scheduler.reference === 'finishMicrobreak' && settings.get('microbreakStrictMode') &&
-        !settings.get('showTrayMenuInStrictMode')) ||
-      (breakPlanner.scheduler.reference === 'finishBreak' && settings.get('breakStrictMode') &&
+    !settings.get('showTrayMenuInStrictMode')) ||
+    (breakPlanner.scheduler.reference === 'finishBreak' && settings.get('breakStrictMode') &&
       !settings.get('showTrayMenuInStrictMode'))
   ) {
     // empty menu, we are in strict mode
