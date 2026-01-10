@@ -1,36 +1,42 @@
 import {
-  app, nativeTheme, BrowserWindow, Menu, ipcMain,
-  screen, shell, dialog, globalShortcut, Tray,
-  powerMonitor
+  BrowserWindow, Menu,
+  Tray,
+  app,
+  dialog, globalShortcut,
+  ipcMain,
+  nativeTheme,
+  powerMonitor,
+  screen, shell
 } from 'electron'
-import { EventEmitter } from 'node:events'
-import { readFile, writeFile, existsSync, mkdirSync } from 'node:fs'
-import { exec } from 'node:child_process'
-import { promisify } from 'util'
-import { dirname, join } from 'path'
-import { resolveLocalImage } from './utils/imageResolver.js'
-import { fileURLToPath } from 'url'
-import i18next from 'i18next'
-import Backend from 'i18next-fs-backend'
 import log from 'electron-log/main.js'
 import Store from 'electron-store'
 import humanizeDuration from 'humanize-duration'
+import i18next from 'i18next'
 import { DateTime } from 'luxon'
+import { EventEmitter } from 'node:events'
+import { existsSync, mkdirSync, readFile, writeFile } from 'node:fs'
+import { dirname, join } from 'path'
+import { fileURLToPath } from 'url'
+import { resolveLocalImage } from './utils/imageResolver.js'
 
+import BreaksPlanner from './breaksPlanner.js'
+import AutostartManager from './utils/autostartManager.js'
+import { registerBreakShortcuts } from './utils/breakShortcuts.js'
+import { createChromeMonitor, createChromeOverlayWindows as createChromeOverlayWindowsUtil, getChromeWindows, isChromeActive } from './utils/chromeOverlay.js'
+import Command from './utils/commands.js'
+import defaultSettings from './utils/defaultSettings.js'
+import DisplayManager from './utils/displayManager.js'
+import ProcessMonitor from './utils/processMonitor.js'
 import {
   canPostpone, canSkip, formatTimeRemaining,
-  minutesRemaining, insideWindowsStore, insideFlatpak, insideSnap, insideWindowsPortable
+  insideFlatpak, insideSnap, insideWindowsPortable,
+  insideWindowsStore
 } from './utils/utils.js'
-import IdeasLoader from './utils/ideasLoader.js'
-import BreaksPlanner from './breaksPlanner.js'
-import AppIcon from './utils/appIcon.js'
-import { UntilMorning } from './utils/untilMorning.js'
-import AutostartManager from './utils/autostartManager.js'
-import Command from './utils/commands.js'
-import { registerBreakShortcuts } from './utils/breakShortcuts.js'
-import defaultSettings from './utils/defaultSettings.js'
-import StatusMessages from './utils/statusMessages.js'
-import DisplayManager from './utils/displayManager.js'
+import { calculateBackgroundColor as calculateBackgroundColorUtil, closeWindows, createContributorSettingsWindow as createContributorSettingsWindowUtil, createMyStretchlyWindow as createMyStretchlyWindowUtil, createPreferencesWindow as createPreferencesWindowUtil, createProcessWindow, createSyncPreferencesWindow as createSyncPreferencesWindowUtil, createWelcomeWindow as createWelcomeWindowUtil, getBlurredBackgroundWindowOptions as getBlurredBackgroundWindowOptionsUtil } from './utils/windowManager.js'
+import { breakComplete, enterManualAwaitPhase } from './utils/breakManager.js'
+import { trayIconPath, windowIconPath, getTrayMenuTemplate, updateToolTip } from './utils/trayManager.js'
+import { registerIpcHandlers } from './utils/ipcHandlers.js'
+import { startI18next, loadIdeas, planVersionCheck } from './utils/appLifecycle.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -51,6 +57,41 @@ process.on('uncaughtException', (err, _) => {
   })
 })
 
+// Prevent termination during breaks
+function isInBreak () {
+  if (!breakPlanner || !settings) return false
+  const ref = breakPlanner.scheduler.reference
+  const inMicrobreak = ref === 'finishMicrobreak' && settings.get('microbreakStrictMode')
+  const inBreak = ref === 'finishBreak' && settings.get('breakStrictMode')
+  return inMicrobreak || inBreak
+}
+
+// Handle SIGTERM (graceful termination request)
+process.on('SIGTERM', (signal) => {
+  if (isInBreak()) {
+    log.warn('Stretchly: SIGTERM received but break is active - ignoring')
+    // Don't exit - signal is ignored
+    return
+  }
+  log.info('Stretchly: SIGTERM received, shutting down gracefully')
+  app.isQuitting = true
+  app.quit()
+})
+
+// Handle SIGINT (Ctrl+C)
+process.on('SIGINT', (signal) => {
+  if (isInBreak()) {
+    log.warn('Stretchly: SIGINT received but break is active - ignoring')
+    // Don't exit - signal is ignored
+    return
+  }
+  log.info('Stretchly: SIGINT received, shutting down gracefully')
+  app.isQuitting = true
+  app.quit()
+})
+
+// Note: SIGKILL cannot be caught - it's a force kill that bypasses all handlers
+
 nativeTheme.on('updated', function theThemeHasChanged () {
   if (!gotTheLock) {
     return
@@ -67,6 +108,7 @@ let displayManager = null
 let processWin = null
 let microbreakWins = null
 let breakWins = null
+let chromeMonitor = null
 let preferencesWin = null
 let welcomeWin = null
 let contributorPreferencesWin = null
@@ -78,6 +120,7 @@ let nextIdea = null
 let updateChecker
 let currentTrayIconPath = null
 let currentTrayMenuTemplate = null
+let processMonitor = null
 let trayUpdateIntervalObj = null
 
 if (insideWindowsPortable()) {
@@ -196,6 +239,10 @@ app.on('ready', initialize)
 app.on('window-all-closed', () => {
   // do nothing, so app wont get closed
 })
+
+// Initialize isQuitting flag for process monitor
+app.isQuitting = false
+
 app.on('before-quit', (event) => {
   if ((breakPlanner.scheduler.reference === 'finishMicrobreak' && settings.get('microbreakStrictMode')) ||
     (breakPlanner.scheduler.reference === 'finishBreak' && settings.get('breakStrictMode'))
@@ -203,12 +250,20 @@ app.on('before-quit', (event) => {
     log.info('Stretchly: preventing app closure (in break with strict mode)')
     event.preventDefault()
   } else {
+    // Mark as graceful quit to prevent auto-restart
+    app.isQuitting = true
+
+    // Stop process monitor
+    if (processMonitor) {
+      processMonitor.stop()
+    }
+
     globalShortcut.unregisterAll()
     // Clean up D-Bus connections
     if (autostartManager) {
       autostartManager.disconnect()
     }
-    app.quit()
+    // Don't call app.quit() here - it's already being called, we just need to allow it
   }
 })
 
@@ -363,6 +418,13 @@ async function initialize (isAppStart = true) {
   }
   log.info(`Stretchly: attempting to set autostart to ${openAtLogin}`)
 
+  // Initialize process monitor for auto-restart
+  processMonitor = new ProcessMonitor({
+    app,
+    settings
+  })
+  processMonitor.start()
+
   const imagesDir = join(app.getPath('userData'), 'images')
   if (!existsSync(imagesDir)) {
     try {
@@ -380,7 +442,7 @@ async function initialize (isAppStart = true) {
 
   displayManager = new DisplayManager(settings)
 
-  startI18next()
+  startI18next({ settings, __dirname })
   startProcessWin()
   createWelcomeWindow()
   nativeTheme.themeSource = settings.get('themeSource')
@@ -418,25 +480,36 @@ async function initialize (isAppStart = true) {
     functions: { pauseBreaks, resumeBreaks, skipToBreak, skipToMicrobreak, resetBreaks }
   })
 
-  updateTray()
-}
+  // Register IPC handlers
+  registerIpcHandlers({
+    postponeMicrobreak,
+    postponeBreak,
+    finishMicrobreak,
+    finishBreak,
+    breakPlanner,
+    settings,
+    i18next,
+    nativeTheme,
+    autostartManager,
+    updateTray,
+    createPreferencesWindow,
+    createContributorSettingsWindow,
+    createSyncPreferencesWindow,
+    createMyStretchlyWindow: ({ __dirname, displayManager, windowIconPath, provider }) => createMyStretchlyWindowUtil({ __dirname, displayManager, windowIconPath, provider }),
+    getMyStretchlyWin: () => myStretchlyWin,
+    setMyStretchlyWin: (win) => { myStretchlyWin = win },
+    getPreferencesWin: () => preferencesWin,
+    setPreferencesWin: (win) => { preferencesWin = win },
+    initialize,
+    defaultSettings,
+    processWin,
+    humanizeDuration,
+    displayManager,
+    windowIconPath: windowIconPathWrapper,
+    global
+  })
 
-function startI18next () {
-  i18next
-    .use(Backend)
-    .init({
-      lng: settings.get('language'),
-      fallbackLng: 'en',
-      debug: !app.isPackaged,
-      backend: {
-        loadPath: join(__dirname, '/locales/{{lng}}.json'),
-        jsonIndent: 2
-      }
-    }, function (err, t) {
-      if (err) {
-        log.error(err.stack)
-      }
-    })
+  updateTray()
 }
 
 i18next.on('languageChanged', () => {
@@ -447,7 +520,9 @@ i18next.on('languageChanged', () => {
     preferencesWin.webContents.send('translate')
   }
   updateTray()
-  loadIdeas()
+  const ideas = loadIdeas({ settings, i18next })
+  breakIdeas = ideas.breakIdeas
+  microbreakIdeas = ideas.microbreakIdeas
 })
 
 function onSuspendOrLock () {
@@ -486,104 +561,30 @@ function startPowerMonitoring () {
   powerMonitor.on('unlock-screen', onResumeOrUnlock)
 }
 
-function closeWindows (windowArray) {
-  for (const window of windowArray) {
-    if (!window || window.isDestroyed()) {
-      continue
-    }
+// closeWindows is now imported from utils/windowManager.js
 
-    window.hide()
-    if (windowArray[0] === window) {
-      ipcMain.removeHandler('send-long-break-data')
-      ipcMain.removeHandler('send-mini-break-data')
-    }
-
-    // Use destroy() for immediate, guaranteed cleanup on all platforms
-    window.destroy()
+// trayIconPath and windowIconPath are now imported from utils/trayManager.js
+// Create wrapper functions that pass the required dependencies
+function trayIconPathWrapper () {
+  if (!breakPlanner || !settings) {
+    // Return a default path if breakPlanner isn't initialized yet
+    return join(__dirname, '/images/app-icons/icon.png')
   }
-  return null
+  return trayIconPath({ breakPlanner, settings, nativeTheme, __dirname })
 }
-
-function trayIconPath () {
-  const params = {
-    paused:
-      breakPlanner.isPaused ||
-      breakPlanner.dndManager.isOnDnd ||
-      breakPlanner.naturalBreaksManager.isSchedulerCleared ||
-      breakPlanner.appExclusionsManager.isSchedulerCleared,
-    monochrome: settings.get('useMonochromeTrayIcon'),
-    inverted: settings.get('useMonochromeInvertedTrayIcon'),
-    darkMode: nativeTheme.shouldUseDarkColors,
-    platform: process.platform,
-    trayIconStyle: settings.get('trayIconStyle'),
-    timeToBreak: minutesRemaining(breakPlanner.timeToNextBreak),
-    percentage: breakPlanner.progressPercentage,
-    reference: breakPlanner.scheduler.reference
-  }
-  const trayIconFileName = new AppIcon(params).trayIconFileName
-  const pathToTrayIcon = join(__dirname, '/images/app-icons/', trayIconFileName)
-  return pathToTrayIcon
-}
-
-function windowIconPath () {
-  const unusedParams = null
-  const params = {
-    paused: false,
-    monochrome: settings.get('useMonochromeTrayIcon'),
-    inverted: settings.get('useMonochromeInvertedTrayIcon'),
-    darkMode: nativeTheme.shouldUseDarkColors,
-    platform: unusedParams,
-    timeToBreakInTrayString: unusedParams,
-    reference: unusedParams
-  }
-  const windowIconFileName = new AppIcon(params).windowIconFileName
-  return join(__dirname, '/images/app-icons', windowIconFileName)
-}
+const windowIconPathWrapper = () => windowIconPath({ settings, nativeTheme, __dirname })
 
 function startProcessWin () {
   if (processWin) {
-    planVersionCheck()
+    planVersionCheckWrapper()
     return
   }
-  const modalPath = 'file://' + join(__dirname, '/process.html')
-
-  processWin = new BrowserWindow({
-    show: false,
-    autoHideMenuBar: true,
-    backgroundThrottling: false,
-    webPreferences: {
-      preload: join(__dirname, './process-preload.mjs'),
-      sandbox: false
-    }
-  })
-  processWin.webContents.loadURL(modalPath)
-  processWin.webContents.once('ready-to-show', () => {
-    planVersionCheck()
-  })
+  processWin = createProcessWindow({ __dirname, planVersionCheck: planVersionCheckWrapper })
 }
 
 function createWelcomeWindow (isAppStart = true) {
-  if (settings.get('isFirstRun') && isAppStart) {
-    const modalPath = 'file://' + join(__dirname, '/welcome.html')
-    welcomeWin = new BrowserWindow({
-      x: displayManager.getDisplayX(-1, 1000),
-      y: displayManager.getDisplayY(-1, 750),
-      width: 1000,
-      height: 750,
-      show: false,
-      autoHideMenuBar: true,
-      icon: windowIconPath(),
-      backgroundColor: 'EDEDED',
-      webPreferences: {
-        preload: join(__dirname, './welcome-preload.mjs'),
-        sandbox: false
-      }
-    })
-    welcomeWin.webContents.loadURL(modalPath)
-    welcomeWin.once('ready-to-show', () => {
-      welcomeWin.center()
-      welcomeWin.show()
-    })
+  welcomeWin = createWelcomeWindowUtil({ __dirname, settings, displayManager, windowIconPath: windowIconPathWrapper, isAppStart })
+  if (welcomeWin) {
     welcomeWin.once('closed', () => {
       welcomeWin = null
     })
@@ -595,25 +596,7 @@ function createContributorSettingsWindow () {
     contributorPreferencesWin.show()
     return
   }
-  const modalPath = 'file://' + join(__dirname, '/contributor-preferences.html')
-  contributorPreferencesWin = new BrowserWindow({
-    x: displayManager.getDisplayX(-1, 735),
-    y: displayManager.getDisplayY(),
-    width: 735,
-    show: false,
-    autoHideMenuBar: true,
-    icon: windowIconPath(),
-    backgroundColor: 'EDEDED',
-    webPreferences: {
-      preload: join(__dirname, './contributor-preferences-preload.mjs'),
-      sandbox: false
-    }
-  })
-  contributorPreferencesWin.webContents.loadURL(modalPath)
-  contributorPreferencesWin.once('ready-to-show', () => {
-    contributorPreferencesWin.center()
-    contributorPreferencesWin.show()
-  })
+  contributorPreferencesWin = createContributorSettingsWindowUtil({ __dirname, displayManager, windowIconPath: windowIconPathWrapper })
   contributorPreferencesWin.once('closed', () => {
     contributorPreferencesWin = null
   })
@@ -624,53 +607,15 @@ function createSyncPreferencesWindow () {
     syncPreferencesWin.show()
     return
   }
-
-  const syncPreferencesUrl = 'https://my.stretchly.net/app/v1/sync'
-  syncPreferencesWin = new BrowserWindow({
-    show: false,
-    autoHideMenuBar: true,
-    width: 1000,
-    height: 700,
-    icon: windowIconPath(),
-    x: displayManager.getDisplayX(),
-    y: displayManager.getDisplayY(),
-    backgroundColor: 'whitesmoke',
-    webPreferences: {
-      preload: join(__dirname, './electron-bridge.mjs'),
-      sandbox: false
-    }
-  })
-  syncPreferencesWin.webContents.loadURL(syncPreferencesUrl)
-
+  syncPreferencesWin = createSyncPreferencesWindowUtil({ __dirname, displayManager, windowIconPath: windowIconPathWrapper })
   syncPreferencesWin.once('closed', () => {
     syncPreferencesWin = null
   })
-
-  syncPreferencesWin.once('ready-to-show', () => {
-    syncPreferencesWin.center()
-    syncPreferencesWin.show()
-  })
 }
 
-function planVersionCheck (seconds = 1) {
-  if (settings.get('disableAppUpdateFeatures')) return
-  if (updateChecker) {
-    clearInterval(updateChecker)
-    updateChecker = null
-  }
-  updateChecker = setTimeout(checkVersion, seconds * 1000)
-}
-
-function checkVersion () {
-  if (settings.get('disableAppUpdateFeatures')) return
-  if (settings.get('checkNewVersion')) {
-    processWin.webContents.send('check-version',
-      `v${app.getVersion()}`,
-      settings.get('notifyNewVersion'),
-      settings.get('silentNotifications')
-    )
-    planVersionCheck(3600 * 48)
-  }
+// planVersionCheck and checkVersion are now imported from utils/appLifecycle.js
+function planVersionCheckWrapper (seconds = 1) {
+  planVersionCheck({ seconds, settings, processWin, app, updateChecker, setUpdateChecker: (val) => { updateChecker = val } })
 }
 
 function startMicrobreakNotification () {
@@ -687,141 +632,99 @@ function startBreakNotification () {
   updateTray()
 }
 
+// getBlurredBackgroundWindowOptions is now imported from utils/windowManager.js
 function getBlurredBackgroundWindowOptions () {
-  if (!settings.get('blurredBackground')) {
-    return {}
-  }
-
-  switch (process.platform) {
-    case 'darwin':
-      return {
-        vibrancy: 'hud',
-        visualEffectState: 'active'
-      }
-    default:
-      return {}
-  }
+  return getBlurredBackgroundWindowOptionsUtil(settings)
 }
 
-const execAsync = promisify(exec)
+// Chrome overlay functions are now in utils/chromeOverlay.js
 
 /**
- * Check if Chrome is running and get its window positions
- * Returns array of Chrome window bounds: [{x, y, width, height}, ...]
+ * Start Chrome monitoring
  */
-async function getChromeWindows () {
-  if (process.platform !== 'darwin') {
-    // For non-macOS, return empty array (feature only works on macOS)
-    return []
+function startChromeMonitoring (breakType) {
+  if (chromeMonitor) {
+    chromeMonitor.stop()
   }
 
-  try {
-    // Use AppleScript to access Chrome directly (more reliable than System Events)
-    // Chrome's bounds format is {left, top, right, bottom}
-    const script = `
-      tell application "System Events"
-        if not (exists process "Google Chrome") and not (exists process "Chromium") then
-          return ""
-        end if
-      end tell
-      try
-        tell application "Google Chrome"
-          set windowList to {}
-          repeat with w in windows
-            try
-              if visible of w then
-                set windowBounds to bounds of w
-                -- bounds format: {left, top, right, bottom}
-                -- convert to: {x, y, width, height}
-                set x to item 1 of windowBounds
-                set y to item 2 of windowBounds
-                set width to (item 3 of windowBounds) - x
-                set height to (item 4 of windowBounds) - y
-                set end of windowList to {x, y, width, height}
-              end if
-            end try
-          end repeat
-          return windowList
-        end tell
-      on error
-        try
-          tell application "Chromium"
-            set windowList to {}
-            repeat with w in windows
-              try
-                if visible of w then
-                  set windowBounds to bounds of w
-                  set x to item 1 of windowBounds
-                  set y to item 2 of windowBounds
-                  set width to (item 3 of windowBounds) - x
-                  set height to (item 4 of windowBounds) - y
-                  set end of windowList to {x, y, width, height}
-                end if
-              end try
-            end repeat
-            return windowList
-          end tell
-        on error errMsg
-          return ""
-        end try
-      end try
-    `
-    const { stdout } = await execAsync(`osascript -e '${script}'`)
-
-    if (!stdout || stdout.trim() === '') {
-      log.debug('Stretchly: Chrome is not running or has no visible windows')
-      return []
-    }
-
-    // Parse AppleScript output: comma-separated list "x1, y1, w1, h1, x2, y2, w2, h2, ..."
-    const windows = []
-    const numbers = stdout.trim().split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n))
-
-    // Each window has 4 values: x, y, width, height
-    for (let i = 0; i < numbers.length; i += 4) {
-      if (i + 3 < numbers.length) {
-        windows.push({
-          x: numbers[i],
-          y: numbers[i + 1],
-          width: numbers[i + 2],
-          height: numbers[i + 3]
-        })
+  chromeMonitor = createChromeMonitor({
+    breakType,
+    getWins: () => breakType === 'mini' ? microbreakWins : breakWins,
+    setWins: (wins) => {
+      if (breakType === 'mini') {
+        microbreakWins = wins
+      } else {
+        breakWins = wins
       }
+    },
+    createChromeOverlayWindows: (breakType, chromeWindows, isInitialStart) => {
+      return createChromeOverlayWindows({
+        breakType,
+        chromeWindows,
+        isInitialStart,
+        microbreakWins,
+        breakWins,
+        settings,
+        breakPlanner,
+        windowIconPath,
+        getBlurredBackgroundWindowOptions: () => getBlurredBackgroundWindowOptions(settings),
+        calculateBackgroundColor: (color) => calculateBackgroundColor(color, settings),
+        microbreakIdeas,
+        breakIdeas,
+        finishMicrobreak,
+        finishBreak,
+        postponeMicrobreak,
+        postponeBreak,
+        canPostpone,
+        canSkip,
+        updateTray
+      })
     }
+  })
+  chromeMonitor.start()
+}
 
-    if (windows.length === 0) {
-      log.debug('Stretchly: Chrome windows found but could not parse positions')
-      log.debug(`Stretchly: Raw output: ${stdout}`)
-    } else {
-      log.info(`Stretchly: Detected ${windows.length} visible Chrome window(s)`)
-    }
-
-    return windows
-  } catch (error) {
-    log.warn('Stretchly: Could not detect Chrome windows:', error.message)
-    return []
+/**
+ * Stop Chrome monitoring
+ */
+function stopChromeMonitoring () {
+  if (chromeMonitor) {
+    chromeMonitor.stop()
+    chromeMonitor = null
   }
 }
 
 /**
- * Check if Chrome is the active/frontmost application
+ * Create Chrome overlay windows for an active break (wrapper for utility function)
+ * @param {string} breakType - 'mini' or 'long'
+ * @param {Array} chromeWindows - Array of Chrome window bounds
+ * @param {boolean} isInitialStart - If true, emit start event to begin timer. If false, break is already running.
  */
-async function isChromeActive () {
-  if (process.platform !== 'darwin') {
-    return false
-  }
-
-  try {
-    const { stdout } = await execAsync(
-      'osascript -e \'tell application "System Events" to get name of first application process whose frontmost is true\''
-    )
-    const appName = stdout.trim().toLowerCase()
-    return appName.includes('chrome') || appName.includes('chromium')
-  } catch (error) {
-    log.warn('Stretchly: Could not check active application:', error.message)
-    return false
-  }
+async function createChromeOverlayWindows (breakType, chromeWindows, isInitialStart = false) {
+  return createChromeOverlayWindowsUtil({
+    breakType,
+    chromeWindows,
+    isInitialStart,
+    microbreakWins,
+    breakWins,
+    settings,
+    breakPlanner,
+    windowIconPath,
+    getBlurredBackgroundWindowOptions: () => getBlurredBackgroundWindowOptions(settings),
+    calculateBackgroundColor: (color) => calculateBackgroundColor(color, settings),
+    microbreakIdeas,
+    breakIdeas,
+    finishMicrobreak,
+    finishBreak,
+    postponeMicrobreak,
+    postponeBreak,
+    canPostpone,
+    canSkip,
+    updateTray
+  })
 }
+
+// isChromeActive is now imported from utils/chromeOverlay.js
 
 async function startMicrobreak () {
   // don't start another break if break running
@@ -830,18 +733,18 @@ async function startMicrobreak () {
     return
   }
 
-  // Check if Chrome is active before showing break overlay
+  // Check if Chrome is active
   const chromeActive = await isChromeActive()
-  if (!chromeActive) {
-    log.info('Stretchly: Chrome is not active, skipping break overlay')
-    return
-  }
+  let chromeWindows = []
 
-  // Get Chrome window positions
-  const chromeWindows = await getChromeWindows()
-  if (chromeWindows.length === 0) {
-    log.info('Stretchly: No Chrome windows detected, skipping break overlay')
-    return
+  if (chromeActive) {
+    // Get Chrome window positions
+    chromeWindows = await getChromeWindows()
+    if (chromeWindows.length === 0) {
+      log.info('Stretchly: Chrome is active but no windows detected, will show normal break')
+    }
+  } else {
+    log.info('Stretchly: Chrome is not active, will show normal break')
   }
 
   const breakDuration = settings.get('microbreakDuration')
@@ -865,6 +768,8 @@ async function startMicrobreak () {
     }
   }
 
+  // Remove existing handler if it exists (in case Chrome monitoring recreates windows)
+  ipcMain.removeHandler('send-mini-break-data')
   ipcMain.handle('send-mini-break-data', (event) => {
     const startTime = Date.now()
     const shortcut = settings.get('endBreakShortcut')
@@ -887,82 +792,98 @@ async function startMicrobreak () {
       calculateBackgroundColor(settings.get('miniBreakColor'))]
   })
 
-  // Create overlay windows for each Chrome window
-  for (let i = 0; i < chromeWindows.length; i++) {
-    const chromeWindow = chromeWindows[i]
-    const windowOptions = {
-      width: chromeWindow.width,
-      height: chromeWindow.height,
-      x: chromeWindow.x,
-      y: chromeWindow.y,
-      autoHideMenuBar: true,
-      icon: windowIconPath(),
-      resizable: false,
-      frame: false,
-      show: false,
-      backgroundThrottling: false,
-      transparent: true,
-      ...getBlurredBackgroundWindowOptions(),
-      backgroundColor: calculateBackgroundColor(settings.get('miniBreakColor')),
-      skipTaskbar: true,
-      focusable: false,
-      alwaysOnTop: true,
-      hasShadow: false,
-      title: 'Stretchly',
-      titleBarStyle: 'hidden',
-      titleBarOverlay: true,
-      webPreferences: {
-        preload: join(__dirname, './microbreak-preload.mjs'),
-        sandbox: false
-      }
-    }
+  // Only show overlay if Chrome is active and has visible windows
+  const showAsChromeOverlay = chromeActive && chromeWindows.length > 0
 
-    let microbreakWinLocal = new BrowserWindow(windowOptions)
-    // seems to help with multiple-displays problems
-    microbreakWinLocal.setSize(windowOptions.width, windowOptions.height)
-
-    microbreakWinLocal.once('ready-to-show', () => {
-      log.info('Stretchly: ready-to-show fired')
-    })
-
-    ipcMain.once('mini-break-loaded', () => {
-      log.info('Stretchly: Mini break window loaded')
-      if (showBreaksAsRegularWindows) {
-        microbreakWinLocal.show()
-      } else {
-        microbreakWinLocal.showInactive()
-      }
-
-      log.info(`Stretchly: showing Chrome overlay window ${i + 1} of ${chromeWindows.length}`)
-      if (process.platform === 'darwin') {
-        microbreakWinLocal.setMinimizable(false)
-        microbreakWinLocal.setClosable(false)
-        microbreakWinLocal.setFullScreen(false)
-        microbreakWinLocal.setKiosk(false)
-      }
-      if (i === 0) {
-        breakPlanner.emit('microbreakStarted', true)
-        log.info('Stretchly: starting Mini break over Chrome')
-      }
-      updateTray()
-    })
-
-    microbreakWinLocal.loadURL(modalPath)
-    microbreakWinLocal.setVisibleOnAllWorkspaces(true)
-    microbreakWinLocal.setAlwaysOnTop(true, 'pop-up-menu')
-    if (microbreakWinLocal) {
-      microbreakWinLocal.on('close', (e) => {
-        if (breakPlanner.scheduler.timeLeft > 0 && settings.get('microbreakStrictMode')) {
-          log.info('Stretchly: preventing closing break window as in strict mode')
-          e.preventDefault()
+  // Create break windows - ONLY as Chrome overlay (never show normal break)
+  if (showAsChromeOverlay) {
+    // Create overlay windows for each Chrome window
+    for (let i = 0; i < chromeWindows.length; i++) {
+      const chromeWindow = chromeWindows[i]
+      const windowOptions = {
+        width: chromeWindow.width,
+        height: chromeWindow.height,
+        x: chromeWindow.x,
+        y: chromeWindow.y,
+        autoHideMenuBar: true,
+        icon: windowIconPath(),
+        resizable: false,
+        frame: false,
+        show: false,
+        backgroundThrottling: false,
+        transparent: true,
+        ...getBlurredBackgroundWindowOptions(),
+        backgroundColor: calculateBackgroundColor(settings.get('miniBreakColor')),
+        skipTaskbar: true,
+        focusable: false,
+        alwaysOnTop: true,
+        hasShadow: false,
+        title: 'Stretchly',
+        titleBarStyle: 'hidden',
+        titleBarOverlay: true,
+        webPreferences: {
+          preload: join(__dirname, './microbreak-preload.mjs'),
+          sandbox: false
         }
+      }
+
+      let microbreakWinLocal = new BrowserWindow(windowOptions)
+      // seems to help with multiple-displays problems
+      microbreakWinLocal.setSize(windowOptions.width, windowOptions.height)
+
+      microbreakWinLocal.once('ready-to-show', () => {
+        log.info('Stretchly: ready-to-show fired')
       })
-      microbreakWinLocal.once('closed', () => {
-        microbreakWinLocal = null
+
+      ipcMain.once('mini-break-loaded', () => {
+        log.info('Stretchly: Mini break window loaded')
+        if (showBreaksAsRegularWindows) {
+          microbreakWinLocal.show()
+        } else {
+          microbreakWinLocal.showInactive()
+        }
+
+        log.info(`Stretchly: showing Chrome overlay window ${i + 1} of ${chromeWindows.length}`)
+        if (process.platform === 'darwin') {
+          microbreakWinLocal.setMinimizable(false)
+          microbreakWinLocal.setClosable(false)
+          microbreakWinLocal.setFullScreen(false)
+          microbreakWinLocal.setKiosk(false)
+        }
+        if (i === 0) {
+          breakPlanner.emit('microbreakStarted', true)
+          log.info('Stretchly: starting Mini break over Chrome')
+        }
+        updateTray()
       })
+
+      microbreakWinLocal.loadURL(modalPath)
+      microbreakWinLocal.setVisibleOnAllWorkspaces(true)
+      microbreakWinLocal.setAlwaysOnTop(true, 'pop-up-menu')
+      if (microbreakWinLocal) {
+        microbreakWinLocal.on('close', (e) => {
+          if (breakPlanner.scheduler.timeLeft > 0 && settings.get('microbreakStrictMode')) {
+            log.info('Stretchly: preventing closing break window as in strict mode')
+            e.preventDefault()
+          }
+        })
+        microbreakWinLocal.once('closed', () => {
+          microbreakWinLocal = null
+        })
+      }
+      microbreakWins.push(microbreakWinLocal)
     }
-    microbreakWins.push(microbreakWinLocal)
+    // Start monitoring to hide overlay if Chrome closes or becomes inactive
+    startChromeMonitoring('mini')
+  } else {
+    // Chrome is not active - don't show any windows, just start monitoring
+    log.info('Stretchly: Chrome is not active, waiting for Chrome to become active before showing break')
+    // Still emit the break started event so the timer runs
+    breakPlanner.emit('microbreakStarted', true)
+    // Start monitoring for Chrome activation
+    startChromeMonitoring('mini')
   }
+
   if (process.platform === 'darwin') {
     if (app.dock.isVisible) {
       app.dock.hide()
@@ -976,18 +897,18 @@ async function startBreak () {
     return
   }
 
-  // Check if Chrome is active before showing break overlay
+  // Check if Chrome is active
   const chromeActive = await isChromeActive()
-  if (!chromeActive) {
-    log.info('Stretchly: Chrome is not active, skipping break overlay')
-    return
-  }
+  let chromeWindows = []
 
-  // Get Chrome window positions
-  const chromeWindows = await getChromeWindows()
-  if (chromeWindows.length === 0) {
-    log.info('Stretchly: No Chrome windows detected, skipping break overlay')
-    return
+  if (chromeActive) {
+    // Get Chrome window positions
+    chromeWindows = await getChromeWindows()
+    if (chromeWindows.length === 0) {
+      log.info('Stretchly: Chrome is active but no windows detected, will show normal break')
+    }
+  } else {
+    log.info('Stretchly: Chrome is not active, will show normal break')
   }
 
   const breakDuration = settings.get('breakDuration')
@@ -1012,6 +933,8 @@ async function startBreak () {
     }
   }
 
+  // Remove existing handler if it exists (in case Chrome monitoring recreates windows)
+  ipcMain.removeHandler('send-long-break-data')
   ipcMain.handle('send-long-break-data', (event) => {
     const startTime = Date.now()
     const shortcut = settings.get('endBreakShortcut')
@@ -1034,82 +957,98 @@ async function startBreak () {
       calculateBackgroundColor(settings.get('mainColor'))]
   })
 
-  // Create overlay windows for each Chrome window
-  for (let i = 0; i < chromeWindows.length; i++) {
-    const chromeWindow = chromeWindows[i]
-    const windowOptions = {
-      width: chromeWindow.width,
-      height: chromeWindow.height,
-      x: chromeWindow.x,
-      y: chromeWindow.y,
-      autoHideMenuBar: true,
-      icon: windowIconPath(),
-      resizable: false,
-      frame: false,
-      show: false,
-      backgroundThrottling: false,
-      transparent: true,
-      ...getBlurredBackgroundWindowOptions(),
-      backgroundColor: calculateBackgroundColor(settings.get('mainColor')),
-      skipTaskbar: true,
-      focusable: false,
-      alwaysOnTop: true,
-      hasShadow: false,
-      title: 'Stretchly',
-      titleBarStyle: 'hidden',
-      titleBarOverlay: true,
-      webPreferences: {
-        preload: join(__dirname, './break-preload.mjs'),
-        sandbox: false
-      }
-    }
+  // Only show overlay if Chrome is active and has visible windows
+  const showAsChromeOverlay = chromeActive && chromeWindows.length > 0
 
-    let breakWinLocal = new BrowserWindow(windowOptions)
-    // seems to help with multiple-displays problems
-    breakWinLocal.setSize(windowOptions.width, windowOptions.height)
-
-    breakWinLocal.once('ready-to-show', () => {
-      log.info('Stretchly: ready-to-show fired')
-    })
-
-    ipcMain.once('long-break-loaded', () => {
-      log.info('Stretchly: Long break window loaded')
-      if (showBreaksAsRegularWindows) {
-        breakWinLocal.show()
-      } else {
-        breakWinLocal.showInactive()
-      }
-
-      log.info(`Stretchly: showing Chrome overlay window ${i + 1} of ${chromeWindows.length}`)
-      if (process.platform === 'darwin') {
-        breakWinLocal.setMinimizable(false)
-        breakWinLocal.setClosable(false)
-        breakWinLocal.setFullScreen(false)
-        breakWinLocal.setKiosk(false)
-      }
-      if (i === 0) {
-        breakPlanner.emit('breakStarted', true)
-        log.info('Stretchly: starting Long break over Chrome')
-      }
-      updateTray()
-    })
-
-    breakWinLocal.loadURL(modalPath)
-    breakWinLocal.setVisibleOnAllWorkspaces(true)
-    breakWinLocal.setAlwaysOnTop(true, 'pop-up-menu')
-    if (breakWinLocal) {
-      breakWinLocal.on('close', (e) => {
-        if (breakPlanner.scheduler.timeLeft > 0 && settings.get('breakStrictMode')) {
-          log.info('Stretchly: preventing closing break window as in strict mode')
-          e.preventDefault()
+  // Create break windows - ONLY as Chrome overlay (never show normal break)
+  if (showAsChromeOverlay) {
+    // Create overlay windows for each Chrome window
+    for (let i = 0; i < chromeWindows.length; i++) {
+      const chromeWindow = chromeWindows[i]
+      const windowOptions = {
+        width: chromeWindow.width,
+        height: chromeWindow.height,
+        x: chromeWindow.x,
+        y: chromeWindow.y,
+        autoHideMenuBar: true,
+        icon: windowIconPath(),
+        resizable: false,
+        frame: false,
+        show: false,
+        backgroundThrottling: false,
+        transparent: true,
+        ...getBlurredBackgroundWindowOptions(),
+        backgroundColor: calculateBackgroundColor(settings.get('mainColor')),
+        skipTaskbar: true,
+        focusable: false,
+        alwaysOnTop: true,
+        hasShadow: false,
+        title: 'Stretchly',
+        titleBarStyle: 'hidden',
+        titleBarOverlay: true,
+        webPreferences: {
+          preload: join(__dirname, './break-preload.mjs'),
+          sandbox: false
         }
+      }
+
+      let breakWinLocal = new BrowserWindow(windowOptions)
+      // seems to help with multiple-displays problems
+      breakWinLocal.setSize(windowOptions.width, windowOptions.height)
+
+      breakWinLocal.once('ready-to-show', () => {
+        log.info('Stretchly: ready-to-show fired')
       })
-      breakWinLocal.once('closed', () => {
-        breakWinLocal = null
+
+      ipcMain.once('long-break-loaded', () => {
+        log.info('Stretchly: Long break window loaded')
+        if (showBreaksAsRegularWindows) {
+          breakWinLocal.show()
+        } else {
+          breakWinLocal.showInactive()
+        }
+
+        log.info(`Stretchly: showing Chrome overlay window ${i + 1} of ${chromeWindows.length}`)
+        if (process.platform === 'darwin') {
+          breakWinLocal.setMinimizable(false)
+          breakWinLocal.setClosable(false)
+          breakWinLocal.setFullScreen(false)
+          breakWinLocal.setKiosk(false)
+        }
+        if (i === 0) {
+          breakPlanner.emit('breakStarted', true)
+          log.info('Stretchly: starting Long break over Chrome')
+        }
+        updateTray()
       })
+
+      breakWinLocal.loadURL(modalPath)
+      breakWinLocal.setVisibleOnAllWorkspaces(true)
+      breakWinLocal.setAlwaysOnTop(true, 'pop-up-menu')
+      if (breakWinLocal) {
+        breakWinLocal.on('close', (e) => {
+          if (breakPlanner.scheduler.timeLeft > 0 && settings.get('breakStrictMode')) {
+            log.info('Stretchly: preventing closing break window as in strict mode')
+            e.preventDefault()
+          }
+        })
+        breakWinLocal.once('closed', () => {
+          breakWinLocal = null
+        })
+      }
+      breakWins.push(breakWinLocal)
     }
-    breakWins.push(breakWinLocal)
+    // Start monitoring to hide overlay if Chrome closes or becomes inactive
+    startChromeMonitoring('long')
+  } else {
+    // Chrome is not active - don't show any windows, just start monitoring
+    log.info('Stretchly: Chrome is not active, waiting for Chrome to become active before showing break')
+    // Still emit the break started event so the timer runs
+    breakPlanner.emit('breakStarted', true)
+    // Start monitoring for Chrome activation
+    startChromeMonitoring('long')
   }
+
   if (process.platform === 'darwin') {
     if (app.dock.isVisible) {
       app.dock.hide()
@@ -1117,45 +1056,22 @@ async function startBreak () {
   }
 }
 
-function breakComplete (shouldPlaySound, windows, breakType) {
-  if (settings.get('endBreakShortcut') && globalShortcut.isRegistered(settings.get('endBreakShortcut'))) {
-    globalShortcut.unregister(settings.get('endBreakShortcut'))
-  }
-  if (shouldPlaySound && !settings.get('silentNotifications')) {
-    const audio = breakType === 'mini' ? 'miniBreakAudio' : 'longBreakAudio'
-    processWin.webContents.send('play-sound', settings.get(audio), settings.get('volume'))
-  }
-  if (process.platform === 'darwin') {
-    // get focus on the last app
-    Menu.sendActionToFirstResponder('hide:')
-  }
-  return closeWindows(windows)
+// breakComplete and enterManualAwaitPhase are now imported from utils/breakManager.js
+// Create wrapper functions
+function breakCompleteWrapper (shouldPlaySound, windows, breakType) {
+  return breakComplete({ shouldPlaySound, windows, breakType, settings, processWin, closeWindows })
 }
 
-function enterManualAwaitPhase (type, shouldPlaySound) {
-  const isMini = type === 'mini'
-  const manualSettingKey = isMini ? 'miniBreakManualFinish' : 'longBreakManualFinish'
-  if (!settings.get(manualSettingKey)) return
-  if (shouldPlaySound && !settings.get('silentNotifications')) {
-    const audioKey = isMini ? 'miniBreakAudio' : 'longBreakAudio'
-    processWin.webContents.send('play-sound', settings.get(audioKey), settings.get('volume'))
-  }
-  const wins = isMini ? microbreakWins : breakWins
-  if (wins) {
-    wins.forEach(w => {
-      if (w && !w.isDestroyed()) {
-        w.webContents.send('enter-manual-await', isMini ? 'microbreak' : 'break')
-      }
-    })
-  }
-  log.info('Stretchly: entering manual finish phase (' + (isMini ? 'Mini' : 'Long') + ' break)')
+function enterManualAwaitPhaseWrapper (type, shouldPlaySound) {
+  return enterManualAwaitPhase({ type, shouldPlaySound, microbreakWins, breakWins, settings, processWin })
 }
 
-const enterMiniBreakManualContinuation = (shouldPlaySound) => enterManualAwaitPhase('mini', shouldPlaySound)
-const enterLongBreakManualContinuation = (shouldPlaySound) => enterManualAwaitPhase('long', shouldPlaySound)
+const enterMiniBreakManualContinuation = (shouldPlaySound) => enterManualAwaitPhaseWrapper('mini', shouldPlaySound)
+const enterLongBreakManualContinuation = (shouldPlaySound) => enterManualAwaitPhaseWrapper('long', shouldPlaySound)
 
 function finishMicrobreak (shouldPlaySound = true, shouldPlanNext = true) {
-  microbreakWins = breakComplete(shouldPlaySound, microbreakWins, 'mini')
+  stopChromeMonitoring()
+  microbreakWins = breakCompleteWrapper(shouldPlaySound, microbreakWins, 'mini')
   log.info(`Stretchly: finishing Mini break (shouldPlanNext: ${shouldPlanNext})`)
   if (shouldPlanNext) {
     breakPlanner.nextBreak()
@@ -1166,7 +1082,8 @@ function finishMicrobreak (shouldPlaySound = true, shouldPlanNext = true) {
 }
 
 function finishBreak (shouldPlaySound = true, shouldPlanNext = true) {
-  breakWins = breakComplete(shouldPlaySound, breakWins, 'long')
+  stopChromeMonitoring()
+  breakWins = breakCompleteWrapper(shouldPlaySound, breakWins, 'long')
   log.info(`Stretchly: finishing Long break (shouldPlanNext: ${shouldPlanNext})`)
   if (shouldPlanNext) {
     breakPlanner.nextBreak()
@@ -1177,14 +1094,14 @@ function finishBreak (shouldPlaySound = true, shouldPlanNext = true) {
 }
 
 function postponeMicrobreak () {
-  microbreakWins = breakComplete(false, microbreakWins, 'mini')
+  microbreakWins = breakCompleteWrapper(false, microbreakWins, 'mini')
   breakPlanner.postponeCurrentBreak()
   log.info('Stretchly: postponing Mini break')
   updateTray()
 }
 
 function postponeBreak () {
-  breakWins = breakComplete(false, breakWins, 'long')
+  breakWins = breakCompleteWrapper(false, breakWins, 'long')
   breakPlanner.postponeCurrentBreak()
   log.info('Stretchly: postponing Long break')
   updateTray()
@@ -1192,10 +1109,10 @@ function postponeBreak () {
 
 function skipToMicrobreak (delay) {
   if (microbreakWins) {
-    microbreakWins = breakComplete(false, microbreakWins)
+    microbreakWins = breakCompleteWrapper(false, microbreakWins, 'mini')
   }
   if (breakWins) {
-    breakWins = breakComplete(false, breakWins)
+    breakWins = breakCompleteWrapper(false, breakWins, 'long')
   }
   if (delay) {
     breakPlanner.skipToMicrobreak(delay)
@@ -1209,10 +1126,10 @@ function skipToMicrobreak (delay) {
 
 function skipToBreak (delay) {
   if (microbreakWins) {
-    microbreakWins = breakComplete(false, microbreakWins)
+    microbreakWins = breakCompleteWrapper(false, microbreakWins, 'mini')
   }
   if (breakWins) {
-    breakWins = breakComplete(false, breakWins)
+    breakWins = breakCompleteWrapper(false, breakWins, 'long')
   }
   if (delay) {
     breakPlanner.skipToBreak(delay)
@@ -1226,49 +1143,19 @@ function skipToBreak (delay) {
 
 function resetBreaks () {
   if (microbreakWins) {
-    microbreakWins = breakComplete(false, microbreakWins)
+    microbreakWins = breakCompleteWrapper(false, microbreakWins, 'mini')
   }
   if (breakWins) {
-    breakWins = breakComplete(false, breakWins)
+    breakWins = breakCompleteWrapper(false, breakWins, 'long')
   }
   breakPlanner.reset()
   log.info('Stretchly: resetting breaks')
   updateTray()
 }
 
+// calculateBackgroundColor is now imported from utils/windowManager.js
 function calculateBackgroundColor (color) {
-  let opacityMultiplier = 1
-  if (settings.get('transparentMode')) {
-    opacityMultiplier = settings.get('opacity')
-  }
-  return color + Math.round(opacityMultiplier * 255).toString(16).padStart(2, '0')
-}
-
-function loadIdeas () {
-  let longBreakIdeasData
-  let miniBreakIdeasData
-  if (settings.get('useIdeasFromSettings')) {
-    longBreakIdeasData = settings.get('breakIdeas')
-    miniBreakIdeasData = settings.get('microbreakIdeas')
-    log.info('Stretchly: loading custom break ideas from preferences file')
-  } else {
-    const t = i18next.getFixedT('en')
-    miniBreakIdeasData = Object.keys(t('miniBreakIdeas',
-      { returnObjects: true }))
-      .map((item) => {
-        return { data: i18next.t(`miniBreakIdeas.${item}.text`), enabled: true }
-      })
-
-    longBreakIdeasData = Object.keys(t('longBreakIdeas',
-      { returnObjects: true }))
-      .map((item) => {
-        return { data: [i18next.t(`longBreakIdeas.${item}.title`), i18next.t(`longBreakIdeas.${item}.text`)], enabled: true }
-      })
-    log.info('Stretchly: loading default break ideas')
-  }
-
-  breakIdeas = new IdeasLoader(longBreakIdeasData).ideas()
-  microbreakIdeas = new IdeasLoader(miniBreakIdeasData).ideas()
+  return calculateBackgroundColorUtil(color, settings)
 }
 
 function pauseBreaks (milliseconds) {
@@ -1301,31 +1188,7 @@ function createPreferencesWindow () {
     preferencesWin.show()
     return
   }
-  const modalPath = 'file://' + join(__dirname, '/preferences.html')
-  const maxHeight = screen
-    .getDisplayNearestPoint(screen.getCursorScreenPoint())
-    .workAreaSize.height * 0.9
-  preferencesWin = new BrowserWindow({
-    autoHideMenuBar: true,
-    show: false,
-    backgroundThrottling: false,
-    icon: windowIconPath(),
-    width: 600,
-    height: 530,
-    maxHeight: Math.round(maxHeight),
-    x: displayManager.getDisplayX(-1, 600),
-    y: displayManager.getDisplayY(-1, 530),
-    backgroundColor: '#EDEDED',
-    webPreferences: {
-      preload: join(__dirname, './preferences-preload.mjs'),
-      sandbox: false
-    }
-  })
-  preferencesWin.webContents.loadURL(modalPath)
-  preferencesWin.once('ready-to-show', () => {
-    preferencesWin.center()
-    preferencesWin.show()
-  })
+  preferencesWin = createPreferencesWindowUtil({ __dirname, displayManager, windowIconPath: windowIconPathWrapper, screen })
   preferencesWin.once('closed', () => {
     preferencesWin = null
   })
@@ -1344,7 +1207,7 @@ function updateTray () {
 
   if (settings.get('showTrayIcon')) {
     if (!appIcon) {
-      appIcon = new Tray(trayIconPath())
+      appIcon = new Tray(trayIconPathWrapper())
       appIcon.on('double-click', () => {
         createPreferencesWindow()
       })
@@ -1356,15 +1219,15 @@ function updateTray () {
       trayUpdateIntervalObj = setInterval(updateTray, 10000)
     }
 
-    updateToolTip()
+    updateToolTipWrapper()
 
-    const newTrayIconPath = trayIconPath()
+    const newTrayIconPath = trayIconPathWrapper()
     if (newTrayIconPath !== currentTrayIconPath) {
       appIcon.setImage(newTrayIconPath)
       currentTrayIconPath = newTrayIconPath
     }
 
-    const newTrayMenuTemplate = getTrayMenuTemplate()
+    const newTrayMenuTemplate = getTrayMenuTemplateWrapper()
     if (JSON.stringify(newTrayMenuTemplate) !== JSON.stringify(currentTrayMenuTemplate)) {
       const trayMenu = Menu.buildFromTemplate(newTrayMenuTemplate)
       appIcon.setContextMenu(trayMenu)
@@ -1373,180 +1236,28 @@ function updateTray () {
   }
 }
 
-function getTrayMenuTemplate () {
-  const trayMenu = []
-
-  if (!settings.get('disableAppUpdateFeatures') && global.isNewVersion) {
-    trayMenu.push({
-      label: i18next.t('main.downloadLatestVersion'),
-      click: function () {
-        shell.openExternal('https://hovancik.net/stretchly/downloads')
-      }
-    }, {
-      type: 'separator'
-    })
-  }
-
-  const statusMessage = new StatusMessages({
-    breakPlanner,
+// getTrayMenuTemplate and updateToolTip are now imported from utils/trayManager.js
+function getTrayMenuTemplateWrapper () {
+  return getTrayMenuTemplate({
     settings,
+    breakPlanner,
+    global,
     i18next,
-    humanizeDuration
-  }).trayMessage
-
-  if (statusMessage !== '') {
-    const messages = statusMessage.split('\n')
-    for (const index in messages) {
-      trayMenu.push({
-        label: messages[index],
-        enabled: false
-      })
-    }
-
-    trayMenu.push({
-      type: 'separator'
-    })
-  }
-
-  if ((breakPlanner.scheduler.reference === 'finishMicrobreak' && settings.get('microbreakStrictMode') &&
-    !settings.get('showTrayMenuInStrictMode')) ||
-    (breakPlanner.scheduler.reference === 'finishBreak' && settings.get('breakStrictMode') &&
-      !settings.get('showTrayMenuInStrictMode'))
-  ) {
-    // empty menu, we are in strict mode
-    return trayMenu
-  }
-
-  if (!(breakPlanner.isPaused || breakPlanner.dndManager.isOnDnd || breakPlanner.appExclusionsManager.isSchedulerCleared)) {
-    let submenu = []
-    if (settings.get('microbreak')) {
-      submenu = submenu.concat([{
-        label: i18next.t('main.toMicrobreak'),
-        click: () => skipToMicrobreak()
-      }])
-    }
-    if (settings.get('break')) {
-      submenu = submenu.concat([{
-        label: i18next.t('main.toBreak'),
-        click: () => skipToBreak()
-      }])
-    }
-    if (settings.get('break') || settings.get('microbreak')) {
-      trayMenu.push({
-        label: i18next.t('main.skipToTheNext'),
-        submenu
-      })
-    }
-  }
-
-  if (breakPlanner.isPaused) {
-    trayMenu.push({
-      label: i18next.t('main.resume'),
-      click: function () {
-        resumeBreaks(false)
-        updateTray()
-      }
-    })
-  } else if (!(breakPlanner.dndManager.isOnDnd || breakPlanner.appExclusionsManager.isSchedulerCleared)) {
-    trayMenu.push({
-      label: i18next.t('main.pause'),
-      submenu: [
-        {
-          label: i18next.t('utils.minutes', { count: 30 }),
-          accelerator: settings.get('pauseBreaksFor30MinutesShortcut') || null,
-          click: function () {
-            pauseBreaks(1800 * 1000)
-          }
-        }, {
-          label: i18next.t('main.forHour'),
-          accelerator: settings.get('pauseBreaksFor1HourShortcut') || null,
-          click: function () {
-            pauseBreaks(3600 * 1000)
-          }
-        }, {
-          label: i18next.t('main.for2Hours'),
-          accelerator: settings.get('pauseBreaksFor2HoursShortcut') || null,
-          click: function () {
-            pauseBreaks(3600 * 2 * 1000)
-          }
-        }, {
-          label: i18next.t('main.for5Hours'),
-          accelerator: settings.get('pauseBreaksFor5HoursShortcut') || null,
-          click: function () {
-            pauseBreaks(3600 * 5 * 1000)
-          }
-        }, {
-          label: i18next.t('main.untilMorning'),
-          accelerator: settings.get('pauseBreaksUntilMorningShortcut') || null,
-          click: function () {
-            const untilMorning = new UntilMorning(settings).msToSunrise()
-            pauseBreaks(untilMorning)
-          }
-        }, {
-          type: 'separator'
-        }, {
-          label: i18next.t('main.indefinitely'),
-          click: function () {
-            pauseBreaks(1)
-          }
-        }
-      ]
-    }, {
-      label: i18next.t('main.resetBreaks'),
-      click: resetBreaks
-    })
-  }
-
-  trayMenu.push({
-    type: 'separator'
-  }, {
-    label: i18next.t('main.preferences'),
-    click: function () {
-      createPreferencesWindow()
-    }
+    humanizeDuration,
+    skipToMicrobreak,
+    skipToBreak,
+    resumeBreaks,
+    pauseBreaks,
+    resetBreaks,
+    createPreferencesWindow,
+    createContributorSettingsWindow,
+    createSyncPreferencesWindow,
+    app
   })
-
-  if (global.isContributor) {
-    trayMenu.push({
-      label: i18next.t('main.contributorPreferences'),
-      click: function () {
-        createContributorSettingsWindow()
-      }
-    }, {
-      label: i18next.t('main.syncPreferences'),
-      click: function () {
-        createSyncPreferencesWindow()
-      }
-    })
-  }
-
-  trayMenu.push({
-    type: 'separator'
-  }, {
-    label: i18next.t('main.quitStretchly'),
-    role: 'quit',
-    click: function () {
-      app.quit()
-    }
-  })
-
-  return trayMenu
 }
 
-function updateToolTip () {
-  let trayMessage = i18next.t('main.toolTipHeader')
-  const message = new StatusMessages({
-    breakPlanner,
-    settings,
-    i18next,
-    humanizeDuration
-  }).trayMessage
-  if (message !== '') {
-    trayMessage += '\n\n' + message
-  }
-  if (appIcon) {
-    appIcon.setToolTip(trayMessage)
-  }
+function updateToolTipWrapper () {
+  updateToolTip({ appIcon, breakPlanner, settings, i18next, humanizeDuration })
 }
 
 function showNotification (text) {
