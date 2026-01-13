@@ -9,7 +9,6 @@ import {
   screen, shell
 } from 'electron'
 import log from 'electron-log/main.js'
-import Store from 'electron-store'
 import humanizeDuration from 'humanize-duration'
 import i18next from 'i18next'
 import { DateTime } from 'luxon'
@@ -29,7 +28,7 @@ import DisplayManager from './utils/displayManager.js'
 import ProcessMonitor from './utils/processMonitor.js'
 import {
   canPostpone, canSkip, formatTimeRemaining,
-  insideFlatpak, insideSnap, insideWindowsPortable,
+  insideFlatpak, insideWindowsPortable,
   insideWindowsStore
 } from './utils/utils.js'
 import { calculateBackgroundColor as calculateBackgroundColorUtil, closeWindows, createContributorSettingsWindow as createContributorSettingsWindowUtil, createMyStretchlyWindow as createMyStretchlyWindowUtil, createPreferencesWindow as createPreferencesWindowUtil, createProcessWindow, createSyncPreferencesWindow as createSyncPreferencesWindowUtil, createWelcomeWindow as createWelcomeWindowUtil, getBlurredBackgroundWindowOptions as getBlurredBackgroundWindowOptionsUtil } from './utils/windowManager.js'
@@ -37,6 +36,7 @@ import { breakComplete, enterManualAwaitPhase } from './utils/breakManager.js'
 import { trayIconPath, windowIconPath, getTrayMenuTemplate, updateToolTip } from './utils/trayManager.js'
 import { registerIpcHandlers } from './utils/ipcHandlers.js'
 import { startI18next, loadIdeas, planVersionCheck } from './utils/appLifecycle.js'
+import { initializeSettings, getSettings } from './utils/settings.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -275,97 +275,8 @@ async function initialize (isAppStart = true) {
   log.info(`Stretchly: ${isAppStart ? '' : 're'}initializing...`)
 
   EventEmitter.setMaxListeners(200) // for watching Store changes
-  if (!settings) {
-    settings = new Store({
-      defaults: defaultSettings,
-      beforeEachMigration: (store, context) => {
-        log.info(`Stretchly: migrating preferences from Stretchly v${context.fromVersion} to v${context.toVersion}`)
-      },
-      migrations: {
-        '1.13.0': store => {
-          if (store.has('pauseBreaksShortcut')) {
-            store.set('pauseBreaksToggleShortcut', store.get('pauseBreaksShortcut'))
-            log.info(`Stretchly: settings pauseBreaksToggleShortcut to "${store.get('pauseBreaksShortcut')}"`)
-            store.delete('pauseBreaksShortcut')
-            log.info('Stretchly: removing pauseBreaksShortcut')
-          } else {
-            log.info('Stretchly: not migrating pauseBreaksShortcut')
-          }
-          if (store.has('pauseBreaksShortcut')) {
-            store.delete('resumeBreaksShortcut')
-            log.info('Stretchly: removing resumeBreaksShortcut')
-          }
-        },
-        '1.17.0': store => {
-          if (store.has('showBreakActionsInStrictMode')) {
-            store.set('showTrayMenuInStrictMode', store.get('showBreakActionsInStrictMode'))
-            log.info(`Stretchly: settings showTrayMenuInStrictMode to "${store.get('showBreakActionsInStrictMode')}"`)
-            store.delete('showBreakActionsInStrictMode')
-            log.info('Stretchly: removing showBreakActionsInStrictMode')
-          } else {
-            log.info('Stretchly: not migrating showBreakActionsInStrictMode')
-          }
-        },
-        '1.18.2': store => {
-          if (insideFlatpak() || insideWindowsStore() || insideSnap()) {
-            if (!store.get('disableAppUpdateFeatures')) {
-              store.set('disableAppUpdateFeatures', true)
-              log.info('Stretchly: setting disableAppUpdateFeatures to true because we are in Flatpak/Windows Store/Snap build')
-            }
-          }
-        },
-        '1.19.0': store => {
-          if (store.has('audio')) {
-            const legacyAudio = store.get('audio')
-            store.set('longBreakAudio', legacyAudio)
-            log.info(`Stretchly: migrating audio to longBreakAudio with value "${legacyAudio}"`)
-            store.delete('audio')
-            log.info('Stretchly: removing audio')
-          } else {
-            log.info('Stretchly: not migrating audio to longBreakAudio')
-          }
-          if (store.has('microbreakStartSoundPlaying')) {
-            const val = store.get('microbreakStartSoundPlaying') ? store.get('miniBreakAudio') : 'silence'
-            store.set('miniBreakStartSound', val)
-            log.info(`Stretchly: migrating microbreakStartSoundPlaying to miniBreakStartSound with value "${val}"`)
-            store.delete('microbreakStartSoundPlaying')
-            log.info('Stretchly: removing microbreakStartSoundPlaying')
-          } else {
-            log.info('Stretchly: not migrating microbreakStartSoundPlaying')
-          }
-          if (store.has('breakStartSoundPlaying')) {
-            const val = store.get('breakStartSoundPlaying') ? store.get('longBreakAudio') : 'silence'
-            store.set('longBreakStartSound', val)
-            log.info(`Stretchly: migrating breakStartSoundPlaying to longBreakStartSound with value "${val}"`)
-            store.delete('breakStartSoundPlaying')
-            log.info('Stretchly: removing breakStartSoundPlaying')
-          } else {
-            log.info('Stretchly: not migrating breakStartSoundPlaying')
-          }
-        },
-        '1.20.0': store => {
-          if (store.has('timeToBreakInTray')) {
-            if (store.get('timeToBreakInTray')) {
-              store.set('trayIconStyle', 'time')
-              log.info('Stretchly: migrating timeToBreakInTray to trayIconStyle="time"')
-            } else {
-              store.set('trayIconStyle', 'default')
-              log.info('Stretchly: migrating tray settings to trayIconStyle="default"')
-            }
-            store.delete('timeToBreakInTray')
-          }
-        }
-      },
-      watch: true
-    })
-    log.info('Stretchly: loading preferences')
-    Store.initRenderer()
-    Object.entries(settings.store).forEach(([key, _]) => {
-      settings.onDidChange(key, (newValue, oldValue) => {
-        log.info(`Stretchly: setting '${key}' to '${JSON.stringify(newValue)}' (was '${JSON.stringify(oldValue)}')`)
-      })
-    })
-  }
+  initializeSettings()
+  settings = getSettings()
   if (!breakPlanner) {
     breakPlanner = new BreaksPlanner(settings)
     breakPlanner.nextBreak()
