@@ -116,7 +116,7 @@ export function initializeSettings () {
  */
 export function getSettings () {
   if (!settingsObject) {
-    throw new Error('Settings have not been initialized. Call initializeSettings() first.')
+    initializeSettings()
   }
   return settingsObject
 }

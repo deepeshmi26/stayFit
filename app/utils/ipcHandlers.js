@@ -5,7 +5,7 @@ import { DateTime } from 'luxon'
 import log from 'electron-log/main.js'
 import { formatTimeRemaining, insideWindowsStore } from './utils.js'
 import { resolveLocalImage } from './imageResolver.js'
-
+import { getSettings } from './settings.js'
 /**
  * Register all IPC handlers
  */
@@ -15,7 +15,6 @@ export function registerIpcHandlers ({
   finishMicrobreak,
   finishBreak,
   breakPlanner,
-  settings,
   i18next,
   nativeTheme,
   autostartManager,
@@ -27,7 +26,6 @@ export function registerIpcHandlers ({
   getMyStretchlyWin,
   setMyStretchlyWin,
   getPreferencesWin,
-  setPreferencesWin,
   initialize,
   defaultSettings,
   processWin,
@@ -36,6 +34,16 @@ export function registerIpcHandlers ({
   windowIconPath,
   global
 }) {
+  const settings = getSettings()
+
+  ipcMain.on('set-global-value', (event, name, value) => {
+    global[name] = value
+  })
+
+  ipcMain.handle('get-global-value', (event, name) => {
+    return global[name]
+  })
+
   ipcMain.on('postpone-mini-break', function (event) {
     postponeMicrobreak()
   })
