@@ -5,8 +5,14 @@ import DndManager from './utils/dndManager.js'
 import AppExclusionsManager from './utils/appExclusionsManager.js'
 import log from 'electron-log/main.js'
 import { getSettings } from './utils/settings.js'
+
+let breaksPlannerInstance = null
+
 class BreaksPlanner extends EventEmitter {
   constructor () {
+    if (breaksPlannerInstance) {
+      return breaksPlannerInstance
+    }
     super()
     this.settings = getSettings()
     this.breakNumber = 0
@@ -16,6 +22,7 @@ class BreaksPlanner extends EventEmitter {
     this.naturalBreaksManager = new NaturalBreaksManager(this.settings)
     this.dndManager = new DndManager(this.settings)
     this.appExclusionsManager = new AppExclusionsManager(this.settings)
+    breaksPlannerInstance = this
 
     this.on('microbreakStarted', (shouldPlaySound) => {
       const interval = this.settings.get('microbreakDuration')
