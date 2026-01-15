@@ -8,7 +8,7 @@ import IdeasLoader from './ideasLoader.js'
  * Start i18next
  */
 export function startI18next ({ settings, __dirname }) {
-  i18next
+  return i18next
     .use(Backend)
     .init({
       lng: settings.get('language'),
@@ -17,10 +17,6 @@ export function startI18next ({ settings, __dirname }) {
       backend: {
         loadPath: join(__dirname, '/locales/{{lng}}.json'),
         jsonIndent: 2
-      }
-    }, function (err, t) {
-      if (err) {
-        log.error(err.stack)
       }
     })
 }
