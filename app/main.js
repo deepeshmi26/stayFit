@@ -31,9 +31,20 @@ import {
   insideFlatpak, insideWindowsPortable
 } from './utils/utils.js'
 import { createContributorSettingsWindow as createContributorSettingsWindowUtil, createMyStretchlyWindow as createMyStretchlyWindowUtil, createPreferencesWindow as createPreferencesWindowUtil, createProcessWindow, createSyncPreferencesWindow as createSyncPreferencesWindowUtil, createWelcomeWindow as createWelcomeWindowUtil } from './utils/windowManager.js'
+import { spawn } from 'child_process'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
+let helperProcess = null
+function startHelperProcess () {
+  if (helperProcess) {
+    helperProcess.kill()
+  }
+  const helperPath = join(__dirname, 'helper', 'overlay-helper')
+  helperProcess = spawn(helperPath, [], {
+    stdio: ['pipe', 'pipe', 'pipe']
+  })
+}
 process.on('uncaughtException', (err, _) => {
   log.error(err)
   const dialogOpts = {
@@ -216,6 +227,7 @@ if (!gotTheLock) {
 }
 
 app.on('ready', () => {
+  startHelperProcess()
   initialize()
 })
 app.on('window-all-closed', () => {
@@ -266,7 +278,7 @@ async function initialize (isAppStart = true) {
   await startI18next({ settings, __dirname })
 
   breakPlanner = new BreaksPlanner()
-  breakControl = new BreakControl(processWin, updateTray)
+  breakControl = new BreakControl(processWin, updateTray, helperProcess)
 
   autostartManager = new AutostartManager({
     app,
@@ -436,61 +448,6 @@ function planVersionCheckWrapper (seconds = 1) {
   planVersionCheck({ seconds, settings, processWin, app, updateChecker, setUpdateChecker: (val) => { updateChecker = val } })
 }
 
-/**
- * Start Chrome monitoring
- */
-// function startChromeMonitoring (breakType) {
-// if (chromeMonitor) {
-//     chromeMonitor.stop()
-// }
-
-// chromeMonitor = createChromeMonitor({
-//     breakType,
-//     getWins: () => breakType === 'mini' ? microbreakWins : breakWins,
-//     setWins: (wins) => {
-//         if (breakType === 'mini') {
-//             microbreakWins = wins
-//         } else {
-//             breakWins = wins
-//         }
-//     },
-//     createChromeOverlayWindows: (breakType, chromeWindows, isInitialStart) => {
-//         return createChromeOverlayWindows({
-//             breakType,
-//             chromeWindows,
-//             isInitialStart,
-//             microbreakWins,
-//             breakWins,
-//             settings,
-//             breakPlanner,
-//             windowIconPath,
-//             getBlurredBackgroundWindowOptions: () => getBlurredBackgroundWindowOptions(settings),
-//             calculateBackgroundColor: (color) => calculateBackgroundColor(color, settings),
-//             microbreakIdeas,
-//             breakIdeas,
-//             finishMicrobreak,
-//             finishBreak,
-//             postponeMicrobreak,
-//             postponeBreak,
-//             canPostpone,
-//             canSkip,
-//             updateTray
-//         })
-//     }
-// })
-// chromeMonitor.start()
-// }
-
-/**
- * Stop Chrome monitoring
- */
-// function stopChromeMonitoring () {
-// if (chromeMonitor) {
-//     chromeMonitor.stop()
-//     chromeMonitor = null
-// }
-// }
-
 function createPreferencesWindow () {
   if (preferencesWin) {
     preferencesWin.show()
@@ -558,3 +515,58 @@ function updateTray () {
     }
   }
 }
+
+/**
+ * Start Chrome monitoring
+ */
+// function startChromeMonitoring (breakType) {
+// if (chromeMonitor) {
+//     chromeMonitor.stop()
+// }
+
+// chromeMonitor = createChromeMonitor({
+//     breakType,
+//     getWins: () => breakType === 'mini' ? microbreakWins : breakWins,
+//     setWins: (wins) => {
+//         if (breakType === 'mini') {
+//             microbreakWins = wins
+//         } else {
+//             breakWins = wins
+//         }
+//     },
+//     createChromeOverlayWindows: (breakType, chromeWindows, isInitialStart) => {
+//         return createChromeOverlayWindows({
+//             breakType,
+//             chromeWindows,
+//             isInitialStart,
+//             microbreakWins,
+//             breakWins,
+//             settings,
+//             breakPlanner,
+//             windowIconPath,
+//             getBlurredBackgroundWindowOptions: () => getBlurredBackgroundWindowOptions(settings),
+//             calculateBackgroundColor: (color) => calculateBackgroundColor(color, settings),
+//             microbreakIdeas,
+//             breakIdeas,
+//             finishMicrobreak,
+//             finishBreak,
+//             postponeMicrobreak,
+//             postponeBreak,
+//             canPostpone,
+//             canSkip,
+//             updateTray
+//         })
+//     }
+// })
+// chromeMonitor.start()
+// }
+
+/**
+ * Stop Chrome monitoring
+ */
+// function stopChromeMonitoring () {
+// if (chromeMonitor) {
+//     chromeMonitor.stop()
+//     chromeMonitor = null
+// }
+// }

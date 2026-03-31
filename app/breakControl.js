@@ -1,4 +1,4 @@
-import { log } from 'console'
+import log from 'electron-log/main.js'
 import { app, BrowserWindow, globalShortcut, ipcMain, nativeTheme, powerMonitor } from 'electron'
 import i18next from 'i18next'
 import { join } from 'path'
@@ -21,8 +21,9 @@ class BreakControl {
   microbreakIdeas
   breakIdeas
   pausedForSuspendOrLock = false
+  helperProcess = null
   updateTray = null // TODO: This update tray function should not be passed. Right now it has been passed as the code is intertwined
-  constructor (processWin, updateTray) {
+  constructor (processWin, updateTray, helperProcess) {
     this.processWin = processWin
     this.updateTray = updateTray
     this.microbreakWins = []
@@ -35,6 +36,7 @@ class BreakControl {
       this.breakIdeas = ideas.breakIdeas
       this.microbreakIdeas = ideas.microbreakIdeas
     })
+    this.helperProcess = helperProcess
 
     this.breakPlanner.nextBreak()
     this.breakPlanner.on('startMicrobreakNotification', () => { this.startMicrobreakNotification() })
@@ -148,6 +150,14 @@ class BreakControl {
   }
 
   createChromeOverlayWindows = (type, chromeWindows) => {
+    if (process.platform === 'darwin') {
+      if (this.helperProcess && this.helperProcess.stdin) {
+        this.helperProcess.stdin.write(JSON.stringify({ cmd: 'SHOW_OVERLAY_RECT', x: 200, y: 200, width: 800, height: 500 }) + '\n')
+      } else {
+        log.error('Stretchly: helperProcess or its stdin is not available; cannot show overlay')
+      }
+      return
+    }
     if (chromeWindows.length === 0) {
       log.info('Stretchly: No chrome windows detected')
       return
